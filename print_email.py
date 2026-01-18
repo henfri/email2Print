@@ -54,6 +54,11 @@ ALLOWED_ATTACHMENT_TYPES = [ext.strip().lower() for ext in get_env_var("ALLOWED_
 ALLOWED_RECIPIENTS = [addr.strip().lower() for addr in get_env_var("ALLOWED_RECIPIENTS", default="").split(",") if addr]
 DETAILED_CONFIRMATION = get_env_var("DETAILED_CONFIRMATION", default="false").lower() == "true"
 
+# --- NEUE KONFIGURATIONEN ---
+DELETE_AFTER_PRINT = get_env_var("DELETE_AFTER_PRINT", default="false").lower() == "true"
+PRINT_ONLY_ATTACHMENTS = get_env_var("PRINT_ONLY_ATTACHMENTS", default="false").lower() == "true"
+# ----------------------------
+
 def decode_mime_words(s):
     if not s:
         return ""
@@ -68,6 +73,7 @@ def is_mostly_html_blank(html):
 
 def print_file(file_path):
     try:
+        # Nutzung von CUPS_SERVER Env Variable wird von 'lp' automatisch erkannt
         subprocess.run(["lp", "-d", PRINTER_NAME, file_path], check=True)
         logger.info(f"Sent to printer: {PRINTER_NAME} - File: {file_path}")
         return True
@@ -88,7 +94,10 @@ def send_confirmation_email(to_email, log_text, printed_files):
             f"{time.strftime('%Y-%m-%d %H:%M:%S')} – Your file '{fname}' was printed on printer '{PRINTER_NAME}'"
             for fname in printed_files
         ]
-        msg.set_content("\n".join(lines) if lines else "No files were printed.")
+        if not lines:
+            msg.set_content("Email processed, but no files were printed (check filters settings).")
+        else:
+            msg.set_content("\n".join(lines))
 
     try:
         logger.info(f"Sending confirmation email to {to_email}")
@@ -124,10 +133,11 @@ def process_email(msg):
         payload = part.get_payload(decode=True)
 
         if not payload or payload.strip() == b"":
-            logger.warning(f"{'Attachment' if filename else 'Email body'} ({content_type}) is empty. Skipping print.")
+            # Skip empty parts
             continue
 
         if filename:
+            # === ATTACHMENT PROCESSING ===
             filename = decode_mime_words(filename)
             suffix = os.path.splitext(filename)[1].lower().lstrip(".")
 
@@ -144,9 +154,13 @@ def process_email(msg):
                 printed_any = True
                 printed_files.append(filename)
             os.remove(tmpfile_path)
-            logger.info(f"Deleted temporary file: {tmpfile_path}")
 
         elif content_type in ["text/plain", "text/html"]:
+            # === BODY PROCESSING ===
+            if PRINT_ONLY_ATTACHMENTS:
+                logger.info(f"Skipping email body ({content_type}) because PRINT_ONLY_ATTACHMENTS is true.")
+                continue
+
             if content_type == "text/html" and is_mostly_html_blank(payload.decode(errors="ignore")):
                 logger.warning(f"HTML email body is blank after stripping tags. Skipping.")
                 continue
@@ -160,7 +174,6 @@ def process_email(msg):
                 printed_any = True
                 printed_files.append(f"EmailBody-{content_type}")
             os.remove(tmpfile_path)
-            logger.info(f"Deleted temporary file: {tmpfile_path}")
 
     if not printed_any:
         logger.warning("No printable content found in this email.")
@@ -185,7 +198,19 @@ def main_loop():
                         raw_email = msg_data[b"RFC822"]
                         msg = email.message_from_bytes(raw_email)
                         process_email(msg)
-                        client.add_flags(uid, [b"\\Seen"])
+                        
+                        # --- NEUE LOGIK FÜR LÖSCHEN VS GELESEN MARKIEREN ---
+                        if DELETE_AFTER_PRINT:
+                            client.delete_messages(uid)
+                            logger.info(f"Message {uid} marked for deletion.")
+                        else:
+                            client.add_flags(uid, [b"\\Seen"])
+                            logger.info(f"Message {uid} marked as seen.")
+                        # ---------------------------------------------------
+
+                    # Optional: Expunge aufrufen, um gelöschte Mails endgültig zu entfernen
+                    if DELETE_AFTER_PRINT:
+                        client.expunge()
                 else:
                     logger.info("No new messages.")
         except Exception as e:
@@ -198,5 +223,7 @@ if __name__ == "__main__":
     print(f"Monitoring inbox: {EMAIL_ACCOUNT}")
     print(f"Printing to printer: {PRINTER_NAME}")
     print(f"Scan interval: {SLEEP_TIME} seconds")
-    logger.info(f"Starting email2print with inbox: {EMAIL_ACCOUNT}, printer: {PRINTER_NAME}, scan interval: {SLEEP_TIME}s")
+    print(f"Print only attachments: {PRINT_ONLY_ATTACHMENTS}")
+    print(f"Delete after print: {DELETE_AFTER_PRINT}")
+    logger.info(f"Starting email2print...")
     main_loop()
